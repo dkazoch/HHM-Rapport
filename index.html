@@ -899,6 +899,19 @@ function findVehicle(input) {
 }
 
 // ====== OCR ======
+function prepareCanvas(canvas,ctx,img,threshold,invert){
+  canvas.width=img.width;canvas.height=img.height;
+  ctx.drawImage(img,0,0);
+  const id=ctx.getImageData(0,0,canvas.width,canvas.height),d=id.data;
+  for(let i=0;i<d.length;i+=4){
+    const a=(d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114);
+    let v=a>threshold?255:0;
+    if(invert) v=255-v;
+    d[i]=d[i+1]=d[i+2]=v;
+  }
+  ctx.putImageData(id,0,0);
+}
+
 async function handlePlatePhoto(input) {
   const file=input.files[0]; if(!file)return;
   const reader=new FileReader();
@@ -912,32 +925,35 @@ async function handlePlatePhoto(input) {
     try {
       const canvas=document.getElementById('scanCanvas'),ctx=canvas.getContext('2d'),img=new Image();
       img.onload=async()=>{
-        // Zentralen Bereich zuschneiden (Nummernschild ist meist in der Mitte)
-        const cropX=Math.floor(img.width*0.05), cropY=Math.floor(img.height*0.15);
-        const cropW=Math.floor(img.width*0.9), cropH=Math.floor(img.height*0.55);
-        canvas.width=cropW;canvas.height=cropH;
-        ctx.drawImage(img,cropX,cropY,cropW,cropH,0,0,cropW,cropH);
-        // Starke Binarisierung für OCR
-        const id=ctx.getImageData(0,0,canvas.width,canvas.height),d=id.data;
-        for(let i=0;i<d.length;i+=4){
-          const a=(d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114);
-          d[i]=d[i+1]=d[i+2]=a>128?255:0;
-        }
-        ctx.putImageData(id,0,0);
-        // Zwei Durchläufe: Englisch (Zahlen/Buchstaben) + Deutsch
-        let plate=null, ocrText='';
-        for(const lng of ['eng','deu']){
+        let plate=null, allOcrText='';
+        // Mehrere Vorverarbeitungen durchlaufen
+        const configs=[
+          {threshold:140,invert:false},
+          {threshold:100,invert:false},
+          {threshold:160,invert:false},
+          {threshold:140,invert:true},
+        ];
+        for(const cfg of configs){
           if(plate) break;
-          const result=await Tesseract.recognize(canvas,lng,{logger:(m)=>{
-            if(m.status==='recognizing text'){pfill.style.width=Math.round(m.progress*100)+'%';stxt.textContent=t('ocrRecognizing')+' '+Math.round(m.progress*100)+'%';}
-          }});
-          ocrText=result.data.text;
-          console.log('OCR ['+lng+']:',ocrText);
-          plate=extractPlate(ocrText);
+          prepareCanvas(canvas,ctx,img,cfg.threshold,cfg.invert);
+          for(const lng of ['eng']){
+            if(plate) break;
+            const result=await Tesseract.recognize(canvas,lng,{
+              logger:(m)=>{if(m.status==='recognizing text'){pfill.style.width=Math.round(m.progress*100)+'%';stxt.textContent=t('ocrRecognizing')+' '+Math.round(m.progress*100)+'%';}},
+              tessedit_char_whitelist:'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -',
+              tessedit_pageseg_mode:'6'
+            });
+            const ocrText=result.data.text;
+            allOcrText+=ocrText+' ';
+            console.log('OCR ['+lng+'] thr='+cfg.threshold+' inv='+cfg.invert+':',ocrText);
+            plate=extractPlate(ocrText);
+          }
         }
+        // Letzter Versuch: alle OCR-Ergebnisse zusammen auswerten
+        if(!plate) plate=extractPlate(allOcrText);
         pbar.style.display='none';
-        if(plate){data.plate=plate;showPlate(plate);lookupVehicle(plate);status.className='ocr-status success';stxt.textContent=t('ocrSuccess')+' ('+ocrText.trim().substring(0,30)+')';}
-        else{status.className='ocr-status error';stxt.textContent=t('ocrFail')+' – "'+ocrText.trim().substring(0,40)+'"';document.getElementById('manualPlateInput').focus();}
+        if(plate){data.plate=plate;showPlate(plate);lookupVehicle(plate);status.className='ocr-status success';stxt.textContent=t('ocrSuccess')+' ('+plate+')';}
+        else{status.className='ocr-status error';stxt.textContent=t('ocrFail')+' – "'+allOcrText.trim().substring(0,60)+'"';document.getElementById('manualPlateInput').focus();}
       };img.src=e.target.result;
     }catch(err){pbar.style.display='none';status.className='ocr-status error';stxt.textContent=t('ocrFail');document.getElementById('manualPlateInput').focus();}
   };reader.readAsDataURL(file);input.value='';
@@ -945,9 +961,21 @@ async function handlePlatePhoto(input) {
 
 function t(key){return T[lang][key]||T.de[key]||key;}
 
+function fixOcrChars(s){
+  // Häufige OCR-Verwechslungen korrigieren
+  // Im Buchstabenteil: 0→O, 1→I, 8→B
+  // Im Zahlenteil: O→0, I→1, B→8, S→5, Z→2
+  const m=s.match(/^([A-Z]{1,3})(\d{1,6})$/);
+  if(!m) return s;
+  let letters=m[1], digits=m[2];
+  letters=letters.replace(/0/g,'O').replace(/1/g,'I').replace(/8/g,'B');
+  digits=digits.replace(/O/g,'0').replace(/I/g,'1').replace(/B/g,'8').replace(/S/g,'5').replace(/Z/g,'2');
+  return letters+digits;
+}
+
 function extractPlate(text){
-  // OCR-Text bereinigen
-  let c=text.toUpperCase().replace(/[^A-Z0-9\s\-]/g,'').trim();
+  // OCR-Text bereinigen — Punkte, Bindestriche, Sonderzeichen entfernen
+  let c=text.toUpperCase().replace(/[^A-Z0-9\s\-·•.]/g,'').replace(/[·•.\-]/g,' ').trim();
   console.log('extractPlate input:',c);
   // Strategie 1: Direkt in der Fahrzeugliste suchen (alle Worte/Tokens prüfen)
   const tokens=c.replace(/[\s\-]+/g,' ').split(' ').filter(t=>t.length>0);
@@ -955,7 +983,8 @@ function extractPlate(text){
   for(let len=1;len<=Math.min(3,tokens.length);len++){
     for(let i=0;i<=tokens.length-len;i++){
       const combo=tokens.slice(i,i+len).join('');
-      const v=findVehicle(combo);
+      let v=findVehicle(combo);
+      if(!v) v=findVehicle(fixOcrChars(combo));
       if(v) return v.plate;
     }
   }
@@ -963,12 +992,14 @@ function extractPlate(text){
   const patterns=c.match(/[A-Z]{1,3}\s*\d{1,4}/g)||[];
   for(const p of patterns){
     const norm=p.replace(/\s/g,'');
-    const v=findVehicle(norm);
+    let v=findVehicle(norm);
+    if(!v) v=findVehicle(fixOcrChars(norm));
     if(v) return v.plate;
   }
   // Strategie 3: Alles zusammen als ein String versuchen
   const full=c.replace(/[\s\-]/g,'');
-  const v=findVehicle(full);
+  let v=findVehicle(full);
+  if(!v) v=findVehicle(fixOcrChars(full));
   if(v) return v.plate;
   // Strategie 4 (Fallback): CH-Kennzeichen-Muster erkennen auch wenn nicht in Liste
   // Formate: XX 1234, XX1234, X 1234 (2 Buchstaben + 1-6 Ziffern)
