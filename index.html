@@ -899,17 +899,84 @@ function findVehicle(input) {
 }
 
 // ====== OCR ======
-function prepareCanvas(canvas,ctx,img,threshold,invert){
-  canvas.width=img.width;canvas.height=img.height;
-  ctx.drawImage(img,0,0);
+// Nummernschild-Region erkennen: helle, rechteckige Bereiche finden
+function findPlateRegions(canvas,ctx){
+  const w=canvas.width, h=canvas.height;
+  const id=ctx.getImageData(0,0,w,h),d=id.data;
+  // Helligkeitskarte erstellen (Nummernschild = heller Bereich)
+  const blockSize=8;
+  const cols=Math.floor(w/blockSize), rows=Math.floor(h/blockSize);
+  const bright=[];
+  for(let r=0;r<rows;r++){
+    bright[r]=[];
+    for(let c=0;c<cols;c++){
+      let sum=0,cnt=0;
+      for(let dy=0;dy<blockSize;dy++){
+        for(let dx=0;dx<blockSize;dx++){
+          const px=((r*blockSize+dy)*w+(c*blockSize+dx))*4;
+          sum+=d[px]*0.299+d[px+1]*0.587+d[px+2]*0.114;cnt++;
+        }
+      }
+      bright[r][c]=sum/cnt;
+    }
+  }
+  // Helle horizontale Streifen finden (Nummernschild ist breit und hell)
+  const regions=[];
+  for(let r=0;r<rows;r++){
+    let start=-1, runLen=0;
+    for(let c=0;c<cols;c++){
+      if(bright[r][c]>180){
+        if(start===-1) start=c;
+        runLen++;
+      } else {
+        if(runLen>=8 && runLen<=cols*0.6){ // Min 64px breit, max 60% des Bildes
+          regions.push({x:start*blockSize, y:Math.max(0,(r-2)*blockSize), w:runLen*blockSize, h:blockSize*5});
+        }
+        start=-1;runLen=0;
+      }
+    }
+    if(runLen>=8 && runLen<=cols*0.6){
+      regions.push({x:start*blockSize, y:Math.max(0,(r-2)*blockSize), w:runLen*blockSize, h:blockSize*5});
+    }
+  }
+  // Deduplizieren und nach Grösse sortieren (grösste zuerst)
+  const merged=[];
+  for(const reg of regions){
+    let found=false;
+    for(const m of merged){
+      if(Math.abs(m.y-reg.y)<blockSize*3 && Math.abs(m.x-reg.x)<blockSize*3){
+        m.x=Math.min(m.x,reg.x); m.y=Math.min(m.y,reg.y);
+        m.w=Math.max(m.w,reg.w); m.h=Math.max(m.h,reg.h);
+        found=true;break;
+      }
+    }
+    if(!found) merged.push({...reg});
+  }
+  merged.sort((a,b)=>(b.w*b.h)-(a.w*a.h));
+  return merged.slice(0,5);
+}
+
+async function ocrRegion(canvas,ctx,img,region,progressCb){
+  // Region auf separaten Canvas zeichnen mit Padding
+  const pad=10;
+  const rx=Math.max(0,region.x-pad), ry=Math.max(0,region.y-pad);
+  const rw=Math.min(img.width-rx,region.w+pad*2), rh=Math.min(img.height-ry,region.h+pad*2);
+  // Hochskalieren für bessere OCR (mind. 200px hoch)
+  const scale=Math.max(1, 200/rh);
+  canvas.width=Math.round(rw*scale); canvas.height=Math.round(rh*scale);
+  ctx.drawImage(img,rx,ry,rw,rh,0,0,canvas.width,canvas.height);
+  // Binarisieren
   const id=ctx.getImageData(0,0,canvas.width,canvas.height),d=id.data;
   for(let i=0;i<d.length;i+=4){
-    const a=(d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114);
-    let v=a>threshold?255:0;
-    if(invert) v=255-v;
-    d[i]=d[i+1]=d[i+2]=v;
+    const a=d[i]*0.299+d[i+1]*0.587+d[i+2]*0.114;
+    d[i]=d[i+1]=d[i+2]=a>130?255:0;
   }
   ctx.putImageData(id,0,0);
+  const result=await Tesseract.recognize(canvas,'eng',{
+    logger:progressCb,
+    tessedit_char_whitelist:'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -·.'
+  });
+  return result;
 }
 
 async function handlePlatePhoto(input) {
@@ -925,37 +992,70 @@ async function handlePlatePhoto(input) {
     try {
       const canvas=document.getElementById('scanCanvas'),ctx=canvas.getContext('2d'),img=new Image();
       img.onload=async()=>{
-        let plate=null, allOcrText='';
-        // Mehrere Vorverarbeitungen durchlaufen
-        const configs=[
-          {threshold:140,invert:false},
-          {threshold:100,invert:false},
-          {threshold:160,invert:false},
-          {threshold:140,invert:true},
-        ];
-        for(const cfg of configs){
-          if(plate) break;
-          prepareCanvas(canvas,ctx,img,cfg.threshold,cfg.invert);
-          for(const lng of ['eng']){
-            if(plate) break;
-            const result=await Tesseract.recognize(canvas,lng,{
-              logger:(m)=>{if(m.status==='recognizing text'){pfill.style.width=Math.round(m.progress*100)+'%';stxt.textContent=t('ocrRecognizing')+' '+Math.round(m.progress*100)+'%';}},
-              tessedit_char_whitelist:'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -',
-              tessedit_pageseg_mode:'6'
-            });
-            const ocrText=result.data.text;
-            allOcrText+=ocrText+' ';
-            console.log('OCR ['+lng+'] thr='+cfg.threshold+' inv='+cfg.invert+':',ocrText);
-            plate=extractPlate(ocrText);
+        const progressCb=(m)=>{if(m.status==='recognizing text'){pfill.style.width=Math.round(m.progress*100)+'%';stxt.textContent=t('ocrRecognizing')+' '+Math.round(m.progress*100)+'%';}};
+        let plate=null, allOcrText='', allWords=[];
+
+        // SCHRITT 1: Volles Bild OCR mit Wort-Analyse
+        canvas.width=img.width;canvas.height=img.height;
+        ctx.drawImage(img,0,0);
+        const fullResult=await Tesseract.recognize(canvas,'eng',{logger:progressCb});
+        const words=fullResult.data.words||[];
+        console.log('OCR words:',words.map(w=>w.text+'('+Math.round(w.confidence)+')').join(', '));
+
+        // Wörter nach Kennzeichen-Muster filtern
+        for(const word of words){
+          const clean=word.text.toUpperCase().replace(/[^A-Z0-9]/g,'');
+          if(clean.length>=2){
+            allWords.push({text:clean, confidence:word.confidence, bbox:word.bbox});
           }
         }
-        // Letzter Versuch: alle OCR-Ergebnisse zusammen auswerten
+        // Einzelne Wörter prüfen
+        for(const w of allWords){
+          plate=extractPlate(w.text);
+          if(plate) break;
+        }
+        // Benachbarte Wörter kombinieren (z.B. "BL" + "1185")
+        if(!plate){
+          for(let i=0;i<allWords.length-1;i++){
+            const combined=allWords[i].text+allWords[i+1].text;
+            plate=extractPlate(combined);
+            if(plate) break;
+          }
+        }
+        allOcrText=fullResult.data.text;
+
+        // SCHRITT 2: Falls nicht gefunden, helle Regionen (Nummernschildkandidaten) einzeln OCR-en
+        if(!plate){
+          // Bild neu laden für Region-Erkennung
+          canvas.width=img.width;canvas.height=img.height;
+          ctx.drawImage(img,0,0);
+          const regions=findPlateRegions(canvas,ctx);
+          console.log('Plate regions found:',regions.length);
+          for(const reg of regions){
+            if(plate) break;
+            const regResult=await ocrRegion(canvas,ctx,img,reg,progressCb);
+            const regText=regResult.data.text;
+            console.log('Region OCR:',regText,'at',reg);
+            allOcrText+=' '+regText;
+            plate=extractPlate(regText);
+            // Auch Wörter der Region prüfen
+            if(!plate && regResult.data.words){
+              for(const w of regResult.data.words){
+                plate=extractPlate(w.text.toUpperCase().replace(/[^A-Z0-9]/g,''));
+                if(plate) break;
+              }
+            }
+          }
+        }
+
+        // SCHRITT 3: Letzter Versuch mit allem zusammen
         if(!plate) plate=extractPlate(allOcrText);
+
         pbar.style.display='none';
         if(plate){data.plate=plate;showPlate(plate);lookupVehicle(plate);status.className='ocr-status success';stxt.textContent=t('ocrSuccess')+' ('+plate+')';}
         else{status.className='ocr-status error';stxt.textContent=t('ocrFail')+' – "'+allOcrText.trim().substring(0,60)+'"';document.getElementById('manualPlateInput').focus();}
       };img.src=e.target.result;
-    }catch(err){pbar.style.display='none';status.className='ocr-status error';stxt.textContent=t('ocrFail');document.getElementById('manualPlateInput').focus();}
+    }catch(err){console.error('OCR error:',err);pbar.style.display='none';status.className='ocr-status error';stxt.textContent=t('ocrFail');document.getElementById('manualPlateInput').focus();}
   };reader.readAsDataURL(file);input.value='';
 }
 
