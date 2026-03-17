@@ -1061,58 +1061,74 @@ async function handlePlatePhoto(input) {
 
 function t(key){return T[lang][key]||T.de[key]||key;}
 
-function fixOcrChars(s){
-  // Häufige OCR-Verwechslungen korrigieren
-  // Im Buchstabenteil: 0→O, 1→I, 8→B
-  // Im Zahlenteil: O→0, I→1, B→8, S→5, Z→2
-  const m=s.match(/^([A-Z]{1,3})(\d{1,6})$/);
-  if(!m) return s;
-  let letters=m[1], digits=m[2];
-  letters=letters.replace(/0/g,'O').replace(/1/g,'I').replace(/8/g,'B');
-  digits=digits.replace(/O/g,'0').replace(/I/g,'1').replace(/B/g,'8').replace(/S/g,'5').replace(/Z/g,'2');
-  return letters+digits;
+// Alle CH-Kantonskürzel
+const CANTONS=['ZH','BE','LU','UR','SZ','OW','NW','GL','ZG','FR','SO','BS','BL','SH','AR','AI','SG','GR','AG','TG','TI','VD','VS','NE','GE','JU'];
+
+function fixOcrToPlate(s){
+  // OCR-Text zu Kennzeichen korrigieren: 2 Buchstaben + bis 6 Ziffern
+  let clean=s.toUpperCase().replace(/[^A-Z0-9]/g,'');
+  if(clean.length<3) return null;
+  // Buchstabenteil (erste 2): Ziffern→Buchstaben korrigieren
+  let letters=clean.substring(0,2);
+  letters=letters.replace(/0/g,'O').replace(/1/g,'I').replace(/8/g,'B').replace(/5/g,'S');
+  // Zahlenteil (Rest): Buchstaben→Ziffern korrigieren
+  let digits=clean.substring(2);
+  digits=digits.replace(/O/g,'0').replace(/I/g,'1').replace(/L/g,'1').replace(/B/g,'8').replace(/S/g,'5').replace(/Z/g,'2').replace(/G/g,'6').replace(/T/g,'1').replace(/[A-Z]/g,'');
+  if(digits.length===0 || digits.length>6) return null;
+  // Prüfen ob gültiges Kantonskürzel
+  if(CANTONS.includes(letters)) return letters+digits;
+  return null;
 }
 
 function extractPlate(text){
-  // OCR-Text bereinigen — Punkte, Bindestriche, Sonderzeichen entfernen
-  let c=text.toUpperCase().replace(/[^A-Z0-9\s\-·•.]/g,'').replace(/[·•.\-]/g,' ').trim();
+  // OCR-Text bereinigen
+  let c=text.toUpperCase().replace(/[^A-Z0-9\s\-·•.,]/g,'').replace(/[·•.\-,]/g,' ').trim();
   console.log('extractPlate input:',c);
-  // Strategie 1: Direkt in der Fahrzeugliste suchen (alle Worte/Tokens prüfen)
+
+  // Strategie 1: CH-Kennzeichen direkt im Text finden (2 Buchstaben + Ziffern)
+  // Suche nach allen möglichen "Buchstaben gefolgt von Ziffern"-Mustern
+  const directMatch=c.match(/[A-Z]{2}\s*\d{1,6}/g)||[];
+  for(const dm of directMatch){
+    const norm=dm.replace(/\s/g,'');
+    const letters=norm.substring(0,2), digits=norm.substring(2);
+    if(CANTONS.includes(letters) && digits.length>=1 && digits.length<=6){
+      // In Fahrzeugliste suchen
+      const v=findVehicle(letters+digits);
+      if(v) return v.plate;
+      // Auch ohne Match in Liste: gültiges CH-Kennzeichen
+      return letters+' '+digits;
+    }
+  }
+
+  // Strategie 2: Tokens kombinieren und OCR-Fehler korrigieren
   const tokens=c.replace(/[\s\-]+/g,' ').split(' ').filter(t=>t.length>0);
-  // Kombinationen von 1-3 aufeinanderfolgenden Tokens testen
   for(let len=1;len<=Math.min(3,tokens.length);len++){
     for(let i=0;i<=tokens.length-len;i++){
       const combo=tokens.slice(i,i+len).join('');
+      // Direkt prüfen
       let v=findVehicle(combo);
-      if(!v) v=findVehicle(fixOcrChars(combo));
       if(v) return v.plate;
+      // Mit OCR-Korrektur
+      const fixed=fixOcrToPlate(combo);
+      if(fixed){
+        v=findVehicle(fixed);
+        if(v) return v.plate;
+        // Gültiges Kantonsformat auch ohne Listenmatch
+        const fl=fixed.substring(0,2), fd=fixed.substring(2);
+        return fl+' '+fd;
+      }
     }
   }
-  // Strategie 2: Buchstaben+Ziffern-Muster extrahieren und in Liste suchen
-  const patterns=c.match(/[A-Z]{1,3}\s*\d{1,4}/g)||[];
-  for(const p of patterns){
-    const norm=p.replace(/\s/g,'');
-    let v=findVehicle(norm);
-    if(!v) v=findVehicle(fixOcrChars(norm));
-    if(v) return v.plate;
-  }
-  // Strategie 3: Alles zusammen als ein String versuchen
+
+  // Strategie 3: Gesamter Text, OCR-korrigiert
   const full=c.replace(/[\s\-]/g,'');
-  let v=findVehicle(full);
-  if(!v) v=findVehicle(fixOcrChars(full));
-  if(v) return v.plate;
-  // Strategie 4 (Fallback): CH-Kennzeichen-Muster erkennen auch wenn nicht in Liste
-  // Formate: XX 1234, XX1234, X 1234 (2 Buchstaben + 1-6 Ziffern)
-  const chPatterns=c.match(/\b([A-Z]{2})\s*(\d{1,6})\b/g)||[];
-  if(chPatterns.length>0){
-    // Bestes Match zurückgeben (längste Ziffernfolge bevorzugen)
-    let best=null, bestLen=0;
-    for(const p of chPatterns){
-      const m=p.match(/([A-Z]{2})\s*(\d{1,6})/);
-      if(m && m[2].length>bestLen){best=m[1]+' '+m[2];bestLen=m[2].length;}
-    }
-    if(best) return best;
+  const fixed=fixOcrToPlate(full);
+  if(fixed){
+    const v=findVehicle(fixed);
+    if(v) return v.plate;
+    return fixed.substring(0,2)+' '+fixed.substring(2);
   }
+
   return null;
 }
 function showPlate(p){document.getElementById('plateResult').classList.remove('hidden');document.getElementById('plateDisplayText').textContent=p;}
